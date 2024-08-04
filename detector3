@@ -1,0 +1,289 @@
+import tkinter as tk
+from tkinter import scrolledtext, messagebox
+import requests
+import re
+import ssl
+import socket
+import whois
+from urllib.parse import urlparse
+import csv
+from datetime import datetime, timedelta
+import os
+
+# File to store the phishing URLs
+PHISHING_DB_FILE = 'phishing_urls.csv'
+# URL of the OpenPhish feed
+OPENPHISH_FEED_URL = 'https://openphish.com/feed.txt'
+# Update frequency in hours
+UPDATE_FREQUENCY = 24
+
+def update_phishing_database():
+    try:
+        response = requests.get(OPENPHISH_FEED_URL)
+        urls = response.text.split('\n')
+        
+        with open(PHISHING_DB_FILE, 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['URL', 'Date Added'])
+            for url in urls:
+                if url.strip():
+                    writer.writerow([url.strip(), datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+        
+        print(f"Phishing database updated. {len(urls)} URLs added.")
+    except Exception as e:
+        print(f"Error updating phishing database: {str(e)}")
+
+def check_database_update():
+    if not os.path.exists(PHISHING_DB_FILE):
+        update_phishing_database()
+    else:
+        file_modified_time = datetime.fromtimestamp(os.path.getmtime(PHISHING_DB_FILE))
+        if datetime.now() - file_modified_time > timedelta(hours=UPDATE_FREQUENCY):
+            update_phishing_database()
+
+def is_valid_url(url):
+    regex = re.compile(
+        r'^(?:http|ftp)s?://'  # http:// or https://
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # domain...
+        r'localhost|'  # localhost...
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
+        r'(?::\d+)?'  # optional port
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    return re.match(regex, url) is not None
+
+def paste_url():
+    try:
+        url = root.clipboard_get()
+        if is_valid_url(url):
+            url_entry.delete(0, tk.END)
+            url_entry.insert(0, url)
+        else:
+            messagebox.showwarning("Invalid URL", "The clipboard content is not a valid URL.")
+    except tk.TclError:
+        messagebox.showwarning("Empty Clipboard", "The clipboard is empty or contains invalid data.")
+
+def check_all():
+    url = url_entry.get()
+    if not is_valid_url(url):
+        result_text.config(state='normal')
+        result_text.delete(1.0, tk.END)
+        result_text.insert(tk.END, "The entered text is not a valid URL.", "red")
+        result_text.config(state='disabled')
+        return
+    check_url()
+    check_ssl_tls()
+    check_phishing_database()
+    analyze_content()
+    check_url_obfuscation()
+
+def check_url():
+    url = url_entry.get()
+    result_text.config(state='normal')
+    result_text.delete(1.0, tk.END)
+    
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc
+    if domain.startswith('www.'):
+        domain = domain[4:]
+    
+    try:
+        response = requests.get(url, timeout=5)
+        content = response.text.lower()
+        
+        suspicious_words = ['login', 'password', 'credit card', 'ssn', 'social security']
+        has_suspicious_words = any(word in content for word in suspicious_words)
+        has_ip_url = re.match(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', domain)
+        
+        if has_suspicious_words or has_ip_url:
+            result_text.insert(tk.END, "⚠️ Potentially Malicious Link! Exercise caution.\n\n", "red")
+            result_text.insert(tk.END, "This link has been identified as potentially malicious.\n", "red")
+            result_text.insert(tk.END, "Potential issues:\n", "red")
+            if has_suspicious_words:
+                result_text.insert(tk.END, "- Contains suspicious keywords related to sensitive information\n", "red")
+            if has_ip_url:
+                result_text.insert(tk.END, "- Uses an IP address instead of a domain name\n", "red")
+            result_text.insert(tk.END, "\nThis link may attempt to steal your personal information or infect your device with malware.", "red")
+            
+            if 'paypal' in domain:
+                result_text.insert(tk.END, "\n\nLegitimate URL: https://www.paypal.com", "red")
+            elif 'amazon' in domain:
+                result_text.insert(tk.END, "\n\nLegitimate URL: https://www.amazon.com", "red")
+            elif 'bank' in domain:
+                result_text.insert(tk.END, "\n\nPlease visit your bank's official website directly.", "red")
+        else:
+            result_text.insert(tk.END, "This link appears to be safe.\n", "green")
+            result_text.insert(tk.END, "However, always exercise caution when clicking on links from unknown sources.", "green")
+        
+        if url.startswith('http://'):
+            result_text.insert(tk.END, "\n\nWarning: This site uses HTTP instead of HTTPS. It is not secure for transmitting sensitive information.", "orange")
+    
+    except requests.RequestException:
+        result_text.insert(tk.END, "Error: Unable to access the URL. It may be invalid or inaccessible.", "red")
+    
+    result_text.config(state='disabled')
+
+def check_ssl_tls():
+    url = url_entry.get()
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc
+    if domain.startswith('www.'):
+        domain = domain[4:]
+    
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((domain, 443)) as sock:
+            with context.wrap_socket(sock, server_hostname=domain) as secure_sock:
+                cert = secure_sock.getpeercert()
+        
+        result_text.config(state='normal')
+        result_text.insert(tk.END, "\n\nSSL/TLS Certificate Information:\n", "blue")
+        result_text.insert(tk.END, f"Issued to: {cert['subject'][0][0][1]}\n", "blue")
+        result_text.insert(tk.END, f"Issued by: {cert['issuer'][0][0][1]}\n", "blue")
+        result_text.insert(tk.END, f"Version: {cert['version']}\n", "blue")
+        result_text.insert(tk.END, f"Serial Number: {cert['serialNumber']}\n", "blue")
+        result_text.insert(tk.END, "The connection is secure.\n", "blue")
+        result_text.config(state='disabled')
+    except Exception as e:
+        result_text.config(state='normal')
+        result_text.insert(tk.END, f"\n\nError checking SSL/TLS: {str(e)}\n", "red")
+        result_text.config(state='disabled')
+
+def check_phishing_database():
+    check_database_update()
+    url = url_entry.get()
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    result_text.config(state='normal')
+    result_text.insert(tk.END, "\n\nPhishing Database Check:\n", "purple")
+    
+    try:
+        with open(PHISHING_DB_FILE, 'r') as file:
+            reader = csv.reader(file)
+            next(reader)  # Skip header
+            for row in reader:
+                if url.strip().lower() == row[0].strip().lower():
+                    result_text.insert(tk.END, f"⚠️ URL found in phishing database.\n", "red")
+                    result_text.insert(tk.END, f"Date added: {row[1]}\n", "purple")
+                    result_text.config(state='disabled')
+                    return
+        
+        result_text.insert(tk.END, "URL not found in phishing database.\n", "green")
+    except Exception as e:
+        result_text.insert(tk.END, f"Error checking phishing database: {str(e)}\n", "red")
+    
+    result_text.config(state='disabled')
+
+def analyze_content():
+    url = url_entry.get()
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    try:
+        response = requests.get(url, timeout=5)
+        content = response.text.lower()
+        
+        result_text.config(state='normal')
+        result_text.insert(tk.END, "\n\nContent Analysis:\n", "cyan")
+        if 'password' in content or 'login' in content:
+            result_text.insert(tk.END, "- The page contains login or password fields. Be cautious about entering sensitive information.\n", "cyan")
+        if 'download' in content:
+            result_text.insert(tk.END, "- The page contains download links. Be careful about downloading files from unknown sources.\n", "cyan")
+        if 'javascript:' in content:
+            result_text.insert(tk.END, "- The page uses JavaScript. While common, malicious sites may use it for harmful purposes.\n", "cyan")
+        result_text.insert(tk.END, "Always verify the legitimacy of a website before entering sensitive information.\n", "cyan")
+        result_text.config(state='disabled')
+    except requests.RequestException:
+        result_text.config(state='normal')
+        result_text.insert(tk.END, "Error: Unable to access the URL for content analysis.\n", "red")
+        result_text.config(state='disabled')
+
+def check_url_obfuscation():
+    url = url_entry.get()
+    result_text.config(state='normal')
+    result_text.insert(tk.END, "\n\nURL Obfuscation Check:\n", "magenta")
+    
+    if '@' in url:
+        result_text.insert(tk.END, "- Warning: URL contains '@' symbol, which can be used for obfuscation.\n", "magenta")
+    if '%' in url:
+        result_text.insert(tk.END, "- Warning: URL contains encoded characters ('%'), which can be used for obfuscation.\n", "magenta")
+    if 'bit.ly' in url or 'tinyurl' in url or 'goo.gl' in url:
+        result_text.insert(tk.END, "- Warning: URL appears to be shortened, which can hide the true destination.\n", "magenta")
+    if len(url) > 100:
+        result_text.insert(tk.END, "- Warning: URL is unusually long, which can be a sign of obfuscation.\n", "magenta")
+    
+    if '@' not in url and '%' not in url and 'bit.ly' not in url and 'tinyurl' not in url and 'goo.gl' not in url and len(url) <= 100:
+        result_text.insert(tk.END, "No obvious signs of URL obfuscation detected.\n", "magenta")
+    
+    result_text.config(state='disabled')
+
+def clear_all():
+    url_entry.delete(0, tk.END)
+    result_text.config(state='normal')
+    result_text.delete(1.0, tk.END)
+    result_text.config(state='disabled')
+
+# Create the main window
+root = tk.Tk()
+root.title("Advanced Phishing Link Detector")
+root.geometry("600x500")
+root.resizable(False, False)  # Prevent window resizing
+
+# Create and place the URL entry field
+url_label = tk.Label(root, text="Enter URL:")
+url_label.pack(pady=5)
+url_frame = tk.Frame(root)
+url_frame.pack(pady=5)
+url_entry = tk.Entry(url_frame, width=50)
+url_entry.pack(side=tk.LEFT)
+paste_button = tk.Button(url_frame, text="Paste", command=paste_url)
+paste_button.pack(side=tk.LEFT, padx=5)
+
+# Create and place the buttons
+button_frame = tk.Frame(root)
+button_frame.pack(pady=10)
+
+button_style = {'width': 15, 'height': 2}
+
+check_all_button = tk.Button(button_frame, text="Check All", command=check_all, **button_style)
+check_all_button.grid(row=0, column=0, padx=5, pady=5)
+
+check_url_button = tk.Button(button_frame, text="Basic URL Check", command=check_url, **button_style)
+check_url_button.grid(row=0, column=1, padx=5, pady=5)
+
+check_ssl_button = tk.Button(button_frame, text="Check SSL/TLS", command=check_ssl_tls, **button_style)
+check_ssl_button.grid(row=0, column=2, padx=5, pady=5)
+
+check_database_button = tk.Button(button_frame, text="Check Phishing DB", command=check_phishing_database, **button_style)
+check_database_button.grid(row=1, column=0, padx=5, pady=5)
+
+analyze_content_button = tk.Button(button_frame, text="Analyze Content", command=analyze_content, **button_style)
+analyze_content_button.grid(row=1, column=1, padx=5, pady=5)
+
+check_obfuscation_button = tk.Button(button_frame, text="Check Obfuscation", command=check_url_obfuscation, **button_style)
+check_obfuscation_button.grid(row=1, column=2, padx=5, pady=5)
+
+clear_button = tk.Button(button_frame, text="Clear All", command=clear_all, **button_style)
+clear_button.grid(row=2, column=1, pady=5)
+
+# Create and place the result text area
+result_text = scrolledtext.ScrolledText(root, wrap=tk.WORD, width=70, height=20, state='disabled')
+result_text.pack(pady=10)
+
+# Configure text colors
+result_text.tag_configure("red", foreground="red")
+result_text.tag_configure("green", foreground="green")
+result_text.tag_configure("blue", foreground="blue")
+result_text.tag_configure("orange", foreground="orange")
+result_text.tag_configure("purple", foreground="purple")
+result_text.tag_configure("cyan", foreground="cyan")
+result_text.tag_configure("magenta", foreground="magenta")
+
+# Start the GUI event loop
+root.mainloop()
